@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Providers;
 
+use App\Awning\AwningThresholds;
 use App\Database\Query\Grammars\SQLiteGrammar;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Model;
@@ -20,7 +21,7 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        //
+        $this->app->singleton(AwningThresholds::class, static fn (): AwningThresholds => AwningThresholds::fromConfig());
     }
 
     /**

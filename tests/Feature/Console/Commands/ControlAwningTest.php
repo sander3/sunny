@@ -53,7 +53,7 @@ class ControlAwningTest extends TestCase
     public function test_it_rejects_invalid_actions(): void
     {
         $this->artisan('awning:control', ['action' => 'stop'])
-            ->expectsOutputToContain('Action must be either "open" or "close".')
+            ->expectsOutputToContain('Action must be either "open", "close", or "auto".')
             ->assertFailed();
     }
 

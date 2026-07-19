@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Awning\AwningAutoAction;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Facades\Http;
 use RuntimeException;
@@ -76,6 +77,60 @@ class TaHomaService
         };
     }
 
+    /**
+     * Read the real awning position from the box so the automation can
+     * reconcile against changes made with the physical remote or Somfy app.
+     * Returns null when the device does not expose a recognisable position.
+     */
+    public function awningPosition(): ?AwningAutoAction
+    {
+        $deviceUrl = $this->awningDeviceUrl();
+
+        foreach ($this->devices() as $device) {
+            if (($device['deviceURL'] ?? null) !== $deviceUrl) {
+                continue;
+            }
+
+            return $this->positionFromStates($device['states'] ?? null);
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  mixed  $states
+     */
+    protected function positionFromStates($states): ?AwningAutoAction
+    {
+        if (! is_array($states)) {
+            return null;
+        }
+
+        $values = [];
+
+        foreach ($states as $state) {
+            $name = data_get($state, 'name');
+
+            if (is_string($name)) {
+                $values[$name] = data_get($state, 'value');
+            }
+        }
+
+        $openClosed = $values['core:OpenClosedState'] ?? null;
+
+        if (is_string($openClosed)) {
+            return $openClosed === 'open' ? AwningAutoAction::Extend : AwningAutoAction::Retract;
+        }
+
+        $deployment = $values['core:DeploymentState'] ?? null;
+
+        if (is_numeric($deployment)) {
+            return (float) $deployment >= 50.0 ? AwningAutoAction::Extend : AwningAutoAction::Retract;
+        }
+
+        return null;
+    }
+
     public function awningDeviceUrl(): string
     {
         $configured = config('services.tahoma.device_url');
@@ -110,7 +165,7 @@ class TaHomaService
             ->timeout(10)
             ->connectTimeout(3);
 
-        if (! config('services.tahoma.verify_ssl')) {
+        if (! config()->boolean('services.tahoma.verify_ssl')) {
             $client->withoutVerifying();
         }
 
@@ -119,8 +174,8 @@ class TaHomaService
 
     protected function baseUrl(): string
     {
-        $host = config('services.tahoma.host');
-        $port = config('services.tahoma.port');
+        $host = config()->string('services.tahoma.host');
+        $port = config()->integer('services.tahoma.port');
 
         return "https://{$host}:{$port}/enduser-mobile-web/1/enduserAPI";
     }
