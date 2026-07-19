@@ -37,4 +37,12 @@ return [
         ],
     ],
 
+    'tahoma' => [
+        'host' => env('TAHOMA_HOST', '192.168.1.42'),
+        'port' => env('TAHOMA_PORT', 8443),
+        'token' => env('TAHOMA_TOKEN'),
+        'device_url' => env('TAHOMA_DEVICE_URL'),
+        'verify_ssl' => env('TAHOMA_VERIFY_SSL', false),
+    ],
+
 ];
