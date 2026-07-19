@@ -1,8 +1,13 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Providers;
 
+use App\Database\Query\Grammars\SQLiteGrammar;
 use Carbon\CarbonImmutable;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\SQLiteConnection;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\ServiceProvider;
@@ -31,7 +36,11 @@ class AppServiceProvider extends ServiceProvider
      */
     protected function configureDefaults(): void
     {
+        Model::shouldBeStrict();
+
         Date::use(CarbonImmutable::class);
+
+        $this->configureDatabasePrecision();
 
         DB::prohibitDestructiveCommands(
             app()->isProduction(),
@@ -46,5 +55,20 @@ class AppServiceProvider extends ServiceProvider
                 ->uncompromised()
             : null,
         );
+    }
+
+    /**
+     * Store datetimes at the maximum precision the engine supports.
+     *
+     * By default Laravel stores second-precision datetimes; overriding the
+     * SQLite query grammar's date format keeps full microsecond precision.
+     */
+    protected function configureDatabasePrecision(): void
+    {
+        $connection = DB::connection();
+
+        if ($connection instanceof SQLiteConnection) {
+            $connection->setQueryGrammar(new SQLiteGrammar($connection));
+        }
     }
 }
