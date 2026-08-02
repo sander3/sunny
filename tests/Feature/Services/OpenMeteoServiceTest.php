@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Tests\Feature\Services;
 
 use App\Services\OpenMeteoService;
+use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
@@ -17,6 +18,7 @@ class OpenMeteoServiceTest extends TestCase
 
         Cache::flush();
         Http::preventStrayRequests();
+        CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-07-19 15:00:00', 'UTC'));
 
         config([
             'awning.latitude' => 52.0,
@@ -26,10 +28,19 @@ class OpenMeteoServiceTest extends TestCase
             'awning.facade_azimuth' => 45.0,
             'awning.glass_area_m2' => 7.2,
             'awning.solar_heat_gain_coefficient' => 0.55,
-            'awning.wind_exposure_factor' => 1.0,
+            'awning.floor' => 1,
+            'awning.metres_per_floor' => 3.0,
+            'awning.site_exposure_factor' => 1.0,
             'awning.weather_cache_seconds' => 600,
             'awning.forecast_lookahead_minutes' => 60,
         ]);
+    }
+
+    protected function tearDown(): void
+    {
+        CarbonImmutable::setTestNow();
+
+        parent::tearDown();
     }
 
     public function test_it_builds_a_weather_snapshot_with_heat_gain(): void
@@ -66,12 +77,45 @@ class OpenMeteoServiceTest extends TestCase
 
     public function test_it_applies_wind_exposure_for_an_exposed_site(): void
     {
-        config(['awning.wind_exposure_factor' => 1.15]);
+        config(['awning.site_exposure_factor' => 1.15]);
 
         $snapshot = app(OpenMeteoService::class)->snapshotFrom($this->forecastPayload(), $this->forecastPayload());
 
         $this->assertEqualsWithDelta(20.0 * 1.15, $snapshot->windSpeedKmh, 0.01);
         $this->assertEqualsWithDelta(32.0 * 1.15, $snapshot->windGustKmh, 0.01);
+    }
+
+    public function test_it_reads_facade_irradiance_from_the_uncached_safety_payload(): void
+    {
+        $safety = $this->forecastPayload();
+        $stale = $this->forecastPayload();
+        $stale['current']['global_tilted_irradiance'] = 900.0;
+        $stale['current']['is_day'] = 0;
+
+        $snapshot = app(OpenMeteoService::class)->snapshotFrom($safety, $stale);
+
+        $this->assertSame(350.0, $snapshot->facadeIrradianceWm2);
+        $this->assertTrue($snapshot->isDay);
+    }
+
+    public function test_it_drops_forecast_slots_that_have_already_finished(): void
+    {
+        CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-07-19 15:20:00', 'UTC'));
+
+        $snapshot = app(OpenMeteoService::class)->snapshotFrom($this->forecastPayload(), $this->forecastPayload());
+
+        $this->assertCount(2, $snapshot->forecast);
+        $this->assertSame('15:15', $snapshot->forecast[0]['at']->format('H:i'));
+    }
+
+    public function test_it_drops_forecast_slots_beyond_the_lookahead(): void
+    {
+        config(['awning.forecast_lookahead_minutes' => 20]);
+
+        $snapshot = app(OpenMeteoService::class)->snapshotFrom($this->forecastPayload(), $this->forecastPayload());
+
+        $this->assertCount(2, $snapshot->forecast);
+        $this->assertSame('15:15', $snapshot->forecast[1]['at']->format('H:i'));
     }
 
     public function test_it_fails_loudly_on_non_positive_cache_configuration(): void

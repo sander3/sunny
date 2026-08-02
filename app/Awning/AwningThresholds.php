@@ -16,22 +16,25 @@ readonly class AwningThresholds
         public float $closeTemperatureC,
         public float $openHeatGainW,
         public float $closeHeatGainW,
-        public float $openFacadeIrradianceWm2,
-        public float $closeFacadeIrradianceWm2,
         public float $maxWindSpeedKmh,
         public float $maxWindGustKmh,
+        public float $squallGustKmh,
         public float $clearWindSpeedKmh,
         public float $clearWindGustKmh,
         public float $maxPrecipitationMm,
+        public int $windLookaheadMinutes,
+        public int $precipitationLookaheadMinutes,
         public int $minStateChangeMinutes,
         public int $windRecoveryMinutes,
         public array $severeWeatherCodeRanges,
     ) {
         $this->assertHysteresis('temperature', $this->closeTemperatureC, $this->openTemperatureC);
         $this->assertHysteresis('heat gain', $this->closeHeatGainW, $this->openHeatGainW);
-        $this->assertHysteresis('facade irradiance', $this->closeFacadeIrradianceWm2, $this->openFacadeIrradianceWm2);
         $this->assertClearBelowMax('wind speed', $this->clearWindSpeedKmh, $this->maxWindSpeedKmh);
         $this->assertClearBelowMax('wind gust', $this->clearWindGustKmh, $this->maxWindGustKmh);
+        $this->assertSquallAboveMax();
+        $this->assertPositive('wind lookahead minutes', $this->windLookaheadMinutes);
+        $this->assertPositive('precipitation lookahead minutes', $this->precipitationLookaheadMinutes);
         $this->assertPositive('min state change minutes', $this->minStateChangeMinutes);
         $this->assertPositive('wind recovery minutes', $this->windRecoveryMinutes);
     }
@@ -43,13 +46,14 @@ readonly class AwningThresholds
             closeTemperatureC: config()->float('awning.close_temperature_c'),
             openHeatGainW: config()->float('awning.open_heat_gain_w'),
             closeHeatGainW: config()->float('awning.close_heat_gain_w'),
-            openFacadeIrradianceWm2: config()->float('awning.open_facade_irradiance_wm2'),
-            closeFacadeIrradianceWm2: config()->float('awning.close_facade_irradiance_wm2'),
             maxWindSpeedKmh: config()->float('awning.max_wind_speed_kmh'),
             maxWindGustKmh: config()->float('awning.max_wind_gust_kmh'),
+            squallGustKmh: config()->float('awning.squall_gust_kmh'),
             clearWindSpeedKmh: config()->float('awning.clear_wind_speed_kmh'),
             clearWindGustKmh: config()->float('awning.clear_wind_gust_kmh'),
             maxPrecipitationMm: config()->float('awning.max_precipitation_mm'),
+            windLookaheadMinutes: config()->integer('awning.wind_lookahead_minutes'),
+            precipitationLookaheadMinutes: config()->integer('awning.precipitation_lookahead_minutes'),
             minStateChangeMinutes: config()->integer('awning.min_state_change_minutes'),
             windRecoveryMinutes: config()->integer('awning.wind_recovery_minutes'),
             severeWeatherCodeRanges: self::severeWeatherCodeRangesFromConfig(),
@@ -100,6 +104,16 @@ readonly class AwningThresholds
         if ($clear > $max) {
             throw new InvalidArgumentException(
                 "Awning {$label} clear threshold ({$clear}) must not exceed the safety maximum ({$max})."
+            );
+        }
+    }
+
+    private function assertSquallAboveMax(): void
+    {
+        if ($this->squallGustKmh < $this->maxWindGustKmh) {
+            throw new InvalidArgumentException(
+                "Awning squall gust threshold ({$this->squallGustKmh}) must be at least the safety maximum ({$this->maxWindGustKmh}); "
+                .'a squall is the subset of gusts worth retracting early for.'
             );
         }
     }

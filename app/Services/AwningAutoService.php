@@ -70,8 +70,10 @@ class AwningAutoService
 
     /**
      * Trust the box over our cache: if the awning was moved with the physical
-     * remote or Somfy app, adopt its real position (with no backoff lock, since
-     * we cannot know when the external change happened).
+     * remote or Somfy app, adopt its real position. An override we can date
+     * against a position we already knew earns the normal backoff, so the next
+     * minute's tick cannot immediately undo what somebody just did by hand. A
+     * cold cache has nothing to compare against, so it adopts without a lock.
      */
     protected function reconciledState(): AwningState
     {
@@ -91,12 +93,20 @@ class AwningAutoService
             return $state;
         }
 
+        $wasOverridden = $state->position !== null;
+
         Log::info('Awning position reconciled from TaHoma', [
             'cached' => $state->position?->value,
             'actual' => $actual->value,
+            'overridden' => $wasOverridden,
         ]);
 
-        $reconciled = new AwningState(position: $actual, reason: 'Reconciled from TaHoma');
+        $reconciled = new AwningState(
+            position: $actual,
+            changedAt: $wasOverridden ? CarbonImmutable::now() : null,
+            reason: $wasOverridden ? 'Moved outside automation' : 'Reconciled from TaHoma',
+        );
+
         $this->stateRepository->save($reconciled);
 
         return $reconciled;

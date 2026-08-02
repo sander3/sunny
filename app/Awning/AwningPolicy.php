@@ -17,7 +17,7 @@ class AwningPolicy
 
     public function decide(WeatherSnapshot $weather, AwningState $state, CarbonImmutable $now): AwningDecision
     {
-        $unsafe = $this->unsafeCondition($weather);
+        $unsafe = $this->unsafeCondition($weather, $now);
 
         if ($unsafe !== null) {
             if ($state->isAt(AwningAutoAction::Retract)) {
@@ -98,7 +98,6 @@ class AwningPolicy
         $temperature = max($weather->temperatureC, $weather->apparentTemperatureC);
 
         return $temperature >= $this->thresholds->openTemperatureC
-            && $weather->facadeIrradianceWm2 >= $this->thresholds->openFacadeIrradianceWm2
             && $weather->estimatedHeatGainW >= $this->thresholds->openHeatGainW;
     }
 
@@ -107,15 +106,22 @@ class AwningPolicy
         $temperature = max($weather->temperatureC, $weather->apparentTemperatureC);
 
         return $temperature < $this->thresholds->closeTemperatureC
-            || $weather->facadeIrradianceWm2 <= $this->thresholds->closeFacadeIrradianceWm2
             || $weather->estimatedHeatGainW <= $this->thresholds->closeHeatGainW;
     }
 
-    private function unsafeCondition(WeatherSnapshot $weather): ?string
+    /**
+     * Live readings retract on sight. Forecast points are graded by lead time:
+     * a squall counts anywhere in the horizon, while a gust merely at the
+     * awning's own limit has to be close enough that the model is likely right
+     * about it, since retracting costs the rest of the recovery cycle too.
+     */
+    private function unsafeCondition(WeatherSnapshot $weather, CarbonImmutable $now): ?string
     {
         $maxSpeed = $this->thresholds->maxWindSpeedKmh;
         $maxGust = $this->thresholds->maxWindGustKmh;
         $maxPrecip = $this->thresholds->maxPrecipitationMm;
+        $windHorizon = $now->addMinutes($this->thresholds->windLookaheadMinutes);
+        $precipHorizon = $now->addMinutes($this->thresholds->precipitationLookaheadMinutes);
 
         if ($weather->windGustKmh >= $maxGust) {
             return sprintf('gusts %.0f km/h exceed %.0f km/h', $weather->windGustKmh, $maxGust);
@@ -134,16 +140,24 @@ class AwningPolicy
         }
 
         foreach ($weather->forecast as $point) {
-            if ($point['wind_gust_kmh'] >= $maxGust) {
-                return sprintf('forecast gusts %.0f km/h at %s', $point['wind_gust_kmh'], $point['at']->format('H:i'));
+            $at = $point['at'];
+
+            if ($point['wind_gust_kmh'] >= $this->thresholds->squallGustKmh) {
+                return sprintf('squall forecast, gusts %.0f km/h at %s', $point['wind_gust_kmh'], $at->format('H:i'));
             }
 
-            if ($point['wind_speed_kmh'] >= $maxSpeed) {
-                return sprintf('forecast wind %.0f km/h at %s', $point['wind_speed_kmh'], $point['at']->format('H:i'));
+            if (! $at->isAfter($windHorizon)) {
+                if ($point['wind_gust_kmh'] >= $maxGust) {
+                    return sprintf('forecast gusts %.0f km/h at %s', $point['wind_gust_kmh'], $at->format('H:i'));
+                }
+
+                if ($point['wind_speed_kmh'] >= $maxSpeed) {
+                    return sprintf('forecast wind %.0f km/h at %s', $point['wind_speed_kmh'], $at->format('H:i'));
+                }
             }
 
-            if ($point['precipitation_mm'] >= $maxPrecip) {
-                return sprintf('forecast precipitation %.1f mm at %s', $point['precipitation_mm'], $point['at']->format('H:i'));
+            if ($point['precipitation_mm'] >= $maxPrecip && ! $at->isAfter($precipHorizon)) {
+                return sprintf('forecast precipitation %.1f mm at %s', $point['precipitation_mm'], $at->format('H:i'));
             }
         }
 
@@ -169,7 +183,7 @@ class AwningPolicy
 
         $minutes = $this->thresholds->minStateChangeMinutes;
 
-        if ($desired === AwningAutoAction::Extend && $state->windClosedAt !== null) {
+        if ($desired === AwningAutoAction::Extend && $this->windCloseIsRecent($state, $now)) {
             $minutes = $this->thresholds->windRecoveryMinutes;
         }
 
@@ -180,6 +194,22 @@ class AwningPolicy
         }
 
         return max(1, (int) ceil(($unlocksAt->getTimestamp() - $now->getTimestamp()) / 60));
+    }
+
+    /**
+     * The shortcut only ever shortens the comfort backoff, so a marker older
+     * than that window is spent. Without this a wind retract on a blustery
+     * evening would still be granting fast reopens the next morning.
+     */
+    private function windCloseIsRecent(AwningState $state, CarbonImmutable $now): bool
+    {
+        if ($state->windClosedAt === null) {
+            return false;
+        }
+
+        return $state->windClosedAt
+            ->addMinutes($this->thresholds->minStateChangeMinutes)
+            ->isAfter($now);
     }
 
     private function comfortReason(AwningAutoAction $action, WeatherSnapshot $weather): string

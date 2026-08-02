@@ -37,16 +37,19 @@ class AwningAutoServiceTest extends TestCase
             'awning.close_temperature_c' => 16.5,
             'awning.open_heat_gain_w' => 450.0,
             'awning.close_heat_gain_w' => 220.0,
-            'awning.open_facade_irradiance_wm2' => 120.0,
-            'awning.close_facade_irradiance_wm2' => 60.0,
             'awning.max_wind_speed_kmh' => 28.0,
             'awning.max_wind_gust_kmh' => 42.0,
+            'awning.squall_gust_kmh' => 55.0,
+            'awning.wind_lookahead_minutes' => 20,
             'awning.clear_wind_speed_kmh' => 22.0,
             'awning.clear_wind_gust_kmh' => 34.0,
-            'awning.max_precipitation_mm' => 0.2,
+            'awning.max_precipitation_mm' => 0.4,
+            'awning.precipitation_lookahead_minutes' => 30,
             'awning.min_state_change_minutes' => 45,
             'awning.wind_recovery_minutes' => 15,
-            'awning.wind_exposure_factor' => 1.0,
+            'awning.floor' => 1,
+            'awning.metres_per_floor' => 3.0,
+            'awning.site_exposure_factor' => 1.0,
             'awning.glass_area_m2' => 7.2,
             'awning.solar_heat_gain_coefficient' => 0.55,
             'awning.weather_cache_seconds' => 60,
@@ -119,6 +122,35 @@ class AwningAutoServiceTest extends TestCase
 
         $this->assertSame(AwningAutoAction::Hold, $result->decision->action);
         $this->assertSame(AwningAutoAction::Retract, app(AwningStateRepository::class)->get()->position);
+
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), 'exec/apply'));
+    }
+
+    public function test_an_external_move_is_protected_by_the_backoff(): void
+    {
+        app(AwningStateRepository::class)->save(new AwningState(
+            position: AwningAutoAction::Extend,
+            changedAt: CarbonImmutable::now()->subHours(2),
+            reason: 'cached extend',
+        ));
+
+        Http::fake([
+            self::DEVICES_URL => Http::response([[
+                'deviceURL' => 'io://0817-9354-9770/15968589',
+                'states' => [['name' => 'core:OpenClosedState', 'value' => 'closed']],
+            ]]),
+            // Hot and sunny: without the override lock this would re-extend at once.
+            'api.open-meteo.com/*' => Http::response($this->payload(temperature: 26.0, irradiance: 400.0, windGust: 16.0)),
+        ]);
+
+        $result = app(AwningAutoService::class)->run();
+
+        $this->assertSame(AwningAutoAction::Hold, $result->decision->action);
+        $this->assertStringContainsString('Backoff active', $result->decision->reason);
+        $this->assertSame(
+            CarbonImmutable::now()->toIso8601String(),
+            app(AwningStateRepository::class)->get()->changedAt?->toIso8601String(),
+        );
 
         Http::assertNotSent(fn ($request) => str_contains($request->url(), 'exec/apply'));
     }

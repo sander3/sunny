@@ -24,13 +24,14 @@ class AwningPolicyTest extends TestCase
             'awning.close_temperature_c' => 16.5,
             'awning.open_heat_gain_w' => 450.0,
             'awning.close_heat_gain_w' => 220.0,
-            'awning.open_facade_irradiance_wm2' => 120.0,
-            'awning.close_facade_irradiance_wm2' => 60.0,
             'awning.max_wind_speed_kmh' => 28.0,
             'awning.max_wind_gust_kmh' => 42.0,
+            'awning.squall_gust_kmh' => 55.0,
             'awning.clear_wind_speed_kmh' => 22.0,
             'awning.clear_wind_gust_kmh' => 34.0,
-            'awning.max_precipitation_mm' => 0.2,
+            'awning.max_precipitation_mm' => 0.4,
+            'awning.wind_lookahead_minutes' => 20,
+            'awning.precipitation_lookahead_minutes' => 30,
             'awning.min_state_change_minutes' => 45,
             'awning.wind_recovery_minutes' => 15,
         ]);
@@ -118,7 +119,7 @@ class AwningPolicyTest extends TestCase
         $this->assertSame(AwningAutoAction::Retract, $decision->action);
     }
 
-    public function test_it_retracts_on_forecast_gusts_within_lookahead(): void
+    public function test_it_retracts_for_gusts_about_to_arrive(): void
     {
         $decision = $this->policy()->decide(
             $this->snapshot([
@@ -127,13 +128,7 @@ class AwningPolicyTest extends TestCase
                 'estimatedHeatGainW' => 1584.0,
                 'windSpeedKmh' => 15.0,
                 'windGustKmh' => 20.0,
-                'forecast' => [[
-                    'at' => CarbonImmutable::now()->addMinutes(30),
-                    'wind_speed_kmh' => 18.0,
-                    'wind_gust_kmh' => 48.0,
-                    'precipitation_mm' => 0.0,
-                    'facade_irradiance_wm2' => 380.0,
-                ]],
+                'forecast' => [$this->forecastPoint(minutes: 15, windGustKmh: 48.0)],
             ]),
             new AwningState(position: AwningAutoAction::Extend, changedAt: CarbonImmutable::now()->subHours(2)),
             CarbonImmutable::now(),
@@ -141,6 +136,45 @@ class AwningPolicyTest extends TestCase
 
         $this->assertSame(AwningAutoAction::Retract, $decision->action);
         $this->assertStringContainsString('forecast gusts', $decision->reason);
+    }
+
+    public function test_it_stays_out_for_a_marginal_gust_forecast_an_hour_away(): void
+    {
+        $decision = $this->policy()->decide(
+            $this->snapshot([
+                'temperatureC' => 26.0,
+                'facadeIrradianceWm2' => 400.0,
+                'estimatedHeatGainW' => 1584.0,
+                'windSpeedKmh' => 15.0,
+                'windGustKmh' => 20.0,
+                'forecast' => [$this->forecastPoint(minutes: 55, windGustKmh: 48.0)],
+            ]),
+            new AwningState(position: AwningAutoAction::Extend, changedAt: CarbonImmutable::now()->subHours(2)),
+            CarbonImmutable::now(),
+        );
+
+        $this->assertSame(AwningAutoAction::Hold, $decision->action);
+        $this->assertStringContainsString('Already extended', $decision->reason);
+    }
+
+    public function test_it_retracts_early_for_a_squall_forecast_an_hour_away(): void
+    {
+        $decision = $this->policy()->decide(
+            $this->snapshot([
+                'temperatureC' => 26.0,
+                'facadeIrradianceWm2' => 400.0,
+                'estimatedHeatGainW' => 1584.0,
+                'windSpeedKmh' => 15.0,
+                'windGustKmh' => 20.0,
+                'forecast' => [$this->forecastPoint(minutes: 55, windGustKmh: 62.0)],
+            ]),
+            new AwningState(position: AwningAutoAction::Extend, changedAt: CarbonImmutable::now()->subHours(2)),
+            CarbonImmutable::now(),
+        );
+
+        $this->assertSame(AwningAutoAction::Retract, $decision->action);
+        $this->assertTrue($decision->bypassesBackoff);
+        $this->assertStringContainsString('squall forecast', $decision->reason);
     }
 
     public function test_it_allows_shorter_recovery_after_wind_close(): void
@@ -183,9 +217,142 @@ class AwningPolicyTest extends TestCase
         $this->assertStringContainsString('wind still elevated', $decision->reason);
     }
 
+    public function test_it_holds_under_bright_overcast_that_falls_short_of_the_open_threshold(): void
+    {
+        $decision = $this->policy()->decide(
+            $this->snapshot([
+                'temperatureC' => 24.0,
+                'facadeIrradianceWm2' => 100.0,
+                'estimatedHeatGainW' => 396.0,
+            ]),
+            new AwningState(position: AwningAutoAction::Retract, changedAt: CarbonImmutable::now()->subHours(2)),
+            CarbonImmutable::now(),
+        );
+
+        $this->assertSame(AwningAutoAction::Hold, $decision->action);
+        $this->assertStringContainsString('Conditions steady', $decision->reason);
+    }
+
+    public function test_it_retracts_on_forecast_rain_inside_the_precipitation_window(): void
+    {
+        $decision = $this->policy()->decide(
+            $this->snapshot([
+                'temperatureC' => 26.0,
+                'facadeIrradianceWm2' => 400.0,
+                'estimatedHeatGainW' => 1584.0,
+                'forecast' => [$this->forecastPoint(minutes: 15, precipitationMm: 0.6)],
+            ]),
+            new AwningState(position: AwningAutoAction::Extend, changedAt: CarbonImmutable::now()->subHours(2)),
+            CarbonImmutable::now(),
+        );
+
+        $this->assertSame(AwningAutoAction::Retract, $decision->action);
+        $this->assertTrue($decision->bypassesBackoff);
+        $this->assertStringContainsString('forecast precipitation', $decision->reason);
+    }
+
+    public function test_it_ignores_forecast_rain_beyond_the_precipitation_window(): void
+    {
+        $decision = $this->policy()->decide(
+            $this->snapshot([
+                'temperatureC' => 26.0,
+                'facadeIrradianceWm2' => 400.0,
+                'estimatedHeatGainW' => 1584.0,
+                'forecast' => [$this->forecastPoint(minutes: 45, precipitationMm: 0.6)],
+            ]),
+            new AwningState(position: AwningAutoAction::Extend, changedAt: CarbonImmutable::now()->subHours(2)),
+            CarbonImmutable::now(),
+        );
+
+        $this->assertSame(AwningAutoAction::Hold, $decision->action);
+        $this->assertStringNotContainsString('precipitation', $decision->reason);
+    }
+
+    public function test_it_retracts_for_every_severe_weather_code(): void
+    {
+        $severeCodes = [56, 57, 65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99];
+
+        foreach ($severeCodes as $code) {
+            $decision = $this->policy()->decide(
+                $this->snapshot([
+                    'temperatureC' => 2.0,
+                    'weatherCode' => $code,
+                ]),
+                new AwningState(position: AwningAutoAction::Extend, changedAt: CarbonImmutable::now()->subHours(2)),
+                CarbonImmutable::now(),
+            );
+
+            $this->assertSame(AwningAutoAction::Retract, $decision->action, "weather code {$code}");
+            $this->assertTrue($decision->bypassesBackoff, "weather code {$code}");
+            $this->assertStringContainsString("severe weather code {$code}", $decision->reason);
+        }
+    }
+
+    /**
+     * Drizzle and slight rain stay out of the severe list on purpose: a little
+     * water on the fabric is normal service, and the millimetre threshold picks
+     * them up once they amount to anything.
+     */
+    public function test_it_leaves_light_precipitation_codes_to_the_millimetre_threshold(): void
+    {
+        foreach ([0, 1, 3, 45, 48, 51, 53, 55, 61, 63] as $code) {
+            $decision = $this->policy()->decide(
+                $this->snapshot([
+                    'temperatureC' => 26.0,
+                    'facadeIrradianceWm2' => 400.0,
+                    'estimatedHeatGainW' => 1584.0,
+                    'weatherCode' => $code,
+                ]),
+                new AwningState(position: AwningAutoAction::Extend, changedAt: CarbonImmutable::now()->subHours(2)),
+                CarbonImmutable::now(),
+            );
+
+            $this->assertSame(AwningAutoAction::Hold, $decision->action, "weather code {$code}");
+            $this->assertStringNotContainsString('severe weather code', $decision->reason);
+        }
+    }
+
+    public function test_it_ignores_a_wind_close_marker_older_than_the_comfort_backoff(): void
+    {
+        $decision = $this->policy()->decide(
+            $this->snapshot([
+                'temperatureC' => 26.0,
+                'facadeIrradianceWm2' => 400.0,
+                'estimatedHeatGainW' => 1584.0,
+            ]),
+            new AwningState(
+                position: AwningAutoAction::Retract,
+                changedAt: CarbonImmutable::now()->subMinutes(16),
+                reason: 'Retracted at dusk',
+                windClosedAt: CarbonImmutable::now()->subHours(14),
+            ),
+            CarbonImmutable::now(),
+        );
+
+        $this->assertSame(AwningAutoAction::Hold, $decision->action);
+        $this->assertStringContainsString('Backoff active (29 min left)', $decision->reason);
+    }
+
     private function policy(): AwningPolicy
     {
         return app(AwningPolicy::class);
+    }
+
+    /**
+     * @return array{at: CarbonImmutable, wind_speed_kmh: float, wind_gust_kmh: float, precipitation_mm: float, facade_irradiance_wm2: float}
+     */
+    private function forecastPoint(
+        int $minutes,
+        float $precipitationMm = 0.0,
+        float $windGustKmh = 20.0,
+    ): array {
+        return [
+            'at' => CarbonImmutable::now()->addMinutes($minutes),
+            'wind_speed_kmh' => 15.0,
+            'wind_gust_kmh' => $windGustKmh,
+            'precipitation_mm' => $precipitationMm,
+            'facade_irradiance_wm2' => 380.0,
+        ];
     }
 
     /**

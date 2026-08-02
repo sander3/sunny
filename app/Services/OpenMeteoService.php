@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Awning\WeatherSnapshot;
+use App\Awning\WindExposure;
 use Carbon\CarbonImmutable;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\PendingRequest;
@@ -16,11 +17,15 @@ use RuntimeException;
 
 class OpenMeteoService
 {
+    private const FORECAST_SLOT_MINUTES = 15;
+
     /**
      * Safety-relevant fields (wind, gusts, precipitation, forecast) are fetched
      * fresh on every call so the every-minute schedule can react to a sudden
-     * gust immediately. The heavier comfort fields (temperature, solar) change
-     * slowly and are cached to keep the API load down.
+     * gust immediately. Facade irradiance and daylight ride along on that same
+     * request because they drive the shade decision and a cloud edge moves far
+     * quicker than the cache window. The remaining comfort fields change slowly
+     * and are cached to keep the API load down.
      */
     public function currentForAwning(): WeatherSnapshot
     {
@@ -52,6 +57,8 @@ class OpenMeteoService
                 'wind_speed_10m',
                 'wind_gusts_10m',
                 'weather_code',
+                'global_tilted_irradiance',
+                'is_day',
             ]),
             'minutely_15' => implode(',', [
                 'precipitation',
@@ -73,8 +80,6 @@ class OpenMeteoService
                 'apparent_temperature',
                 'shortwave_radiation',
                 'direct_radiation',
-                'global_tilted_irradiance',
-                'is_day',
                 'cloud_cover',
             ]),
         ]);
@@ -89,18 +94,18 @@ class OpenMeteoService
         $safetyCurrent = $this->currentSection($safety);
         $comfortCurrent = $this->currentSection($comfort);
 
-        $facadeIrradiance = $this->numeric($comfortCurrent, 'global_tilted_irradiance');
+        $facadeIrradiance = $this->numeric($safetyCurrent, 'global_tilted_irradiance');
         $glassArea = config()->float('awning.glass_area_m2');
         $shgc = config()->float('awning.solar_heat_gain_coefficient');
-        $exposure = config()->float('awning.wind_exposure_factor');
+        $exposure = WindExposure::fromConfig();
         $timezone = config()->string('awning.timezone');
 
         return new WeatherSnapshot(
             observedAt: $this->observedAt($safetyCurrent, $timezone),
             temperatureC: $this->numeric($comfortCurrent, 'temperature_2m'),
             apparentTemperatureC: $this->numeric($comfortCurrent, 'apparent_temperature'),
-            windSpeedKmh: $this->numeric($safetyCurrent, 'wind_speed_10m') * $exposure,
-            windGustKmh: $this->numeric($safetyCurrent, 'wind_gusts_10m') * $exposure,
+            windSpeedKmh: $exposure->apply($this->numeric($safetyCurrent, 'wind_speed_10m')),
+            windGustKmh: $exposure->apply($this->numeric($safetyCurrent, 'wind_gusts_10m')),
             precipitationMm: max(
                 $this->numeric($safetyCurrent, 'precipitation'),
                 $this->numeric($safetyCurrent, 'rain'),
@@ -110,7 +115,7 @@ class OpenMeteoService
             directRadiationWm2: $this->numeric($comfortCurrent, 'direct_radiation'),
             cloudCoverPercent: (int) round($this->numeric($comfortCurrent, 'cloud_cover')),
             weatherCode: (int) round($this->numeric($safetyCurrent, 'weather_code')),
-            isDay: $this->numeric($comfortCurrent, 'is_day') === 1.0,
+            isDay: $this->numeric($safetyCurrent, 'is_day') === 1.0,
             estimatedHeatGainW: round($glassArea * $shgc * $facadeIrradiance, 1),
             forecast: $this->forecastFromPayload($safety, $exposure),
         );
@@ -185,7 +190,7 @@ class OpenMeteoService
      * @param  array<mixed, mixed>  $payload
      * @return list<array{at: CarbonImmutable, wind_speed_kmh: float, wind_gust_kmh: float, precipitation_mm: float, facade_irradiance_wm2: float}>
      */
-    protected function forecastFromPayload(array $payload, float $exposure): array
+    protected function forecastFromPayload(array $payload, WindExposure $exposure): array
     {
         $minutely = $payload['minutely_15'] ?? null;
 
@@ -194,7 +199,8 @@ class OpenMeteoService
         }
 
         $timezone = config()->string('awning.timezone');
-        $horizon = CarbonImmutable::now($timezone)->addMinutes($this->positiveInt('awning.forecast_lookahead_minutes'));
+        $now = CarbonImmutable::now($timezone);
+        $horizon = $now->addMinutes($this->positiveInt('awning.forecast_lookahead_minutes'));
         $forecast = [];
 
         foreach ($minutely['time'] as $index => $time) {
@@ -203,15 +209,16 @@ class OpenMeteoService
             }
 
             $at = CarbonImmutable::parse($time, $timezone);
+            $slotEndsAt = $at->addMinutes(self::FORECAST_SLOT_MINUTES);
 
-            if ($at->greaterThan($horizon)) {
+            if ($at->greaterThan($horizon) || $slotEndsAt->lessThanOrEqualTo($now)) {
                 continue;
             }
 
             $forecast[] = [
                 'at' => $at,
-                'wind_speed_kmh' => $this->numericAt($minutely, 'wind_speed_10m', $index) * $exposure,
-                'wind_gust_kmh' => $this->numericAt($minutely, 'wind_gusts_10m', $index) * $exposure,
+                'wind_speed_kmh' => $exposure->apply($this->numericAt($minutely, 'wind_speed_10m', $index)),
+                'wind_gust_kmh' => $exposure->apply($this->numericAt($minutely, 'wind_gusts_10m', $index)),
                 'precipitation_mm' => $this->numericAt($minutely, 'precipitation', $index),
                 'facade_irradiance_wm2' => $this->numericAt($minutely, 'global_tilted_irradiance', $index),
             ];
